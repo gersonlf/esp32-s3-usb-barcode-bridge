@@ -98,6 +98,25 @@ os mesmos GPIOs 19/20 do leitor.
 O projeto repassa diretamente os relatorios HID do leitor. Assim, o `Enter`
 configurado no leitor tambem e enviado ao celular/tablet/computador.
 
+## Perfil BLE validado
+
+O firmware foi validado funcionando como teclado no **iOS** e no
+**Samsung Galaxy A54**.
+
+A compatibilidade depende do perfil HOGP minimo implementado em
+`main/ble_hid_keyboard.c`:
+
+- um unico Input Report de teclado com 8 bytes;
+- Report Protocol sem Report ID;
+- Report Reference com ID `0` e tipo Input;
+- Report Map e Report Reference acessiveis somente com link criptografado;
+- sem Boot Report, Output Report ou referencia externa para Battery Level;
+- pareamento com bonding, criptografia Level 2 e sem MITM.
+
+Essas caracteristicas nao devem ser substituidas pelo Report ID 1 do exemplo
+generico sem repetir os testes em iOS e Android. A versao anterior conectava e
+enviava notificacoes BLE, mas o iOS nao reconhecia os dados como teclado.
+
 ## Limitacao inicial
 
 Esta versao aceita leitores que se apresentam como **HID Boot Keyboard**, o modo
@@ -114,4 +133,4 @@ mesmos pinos do leitor.
 ## Estado validado
 
 Em 2026-07-30, o firmware foi compilado com ESP-IDF 5.5.4 usando `build_d`,
-gravado na placa e confirmado funcionando no hardware.
+gravado na placa e confirmado funcionando no iOS e no Samsung Galaxy A54.

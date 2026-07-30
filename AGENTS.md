@@ -43,7 +43,7 @@ O dispositivo de destino deve enxergar o ESP32-S3 como um teclado Bluetooth. Ao 
 3. O alvo é sempre:
 
    ```powershell
-   idf.py set-target esp32s3
+   idf.py -B build_d set-target esp32s3
    ```
 
 4. Não migrar para Arduino IDE, PlatformIO ou outro framework sem solicitação expressa.
@@ -57,16 +57,16 @@ O dispositivo de destino deve enxergar o ESP32-S3 como um teclado Bluetooth. Ao 
 10. Toda alteração deve terminar com pelo menos:
 
     ```powershell
-    idf.py build
+    idf.py -B build_d build
     ```
 
 11. Quando houver alteração em `sdkconfig.defaults`, alvo, Bluetooth ou tabela de partições, apagar o estado gerado e reconstruir:
 
     ```powershell
-    Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force build_d -ErrorAction SilentlyContinue
     Remove-Item -Force sdkconfig -ErrorAction SilentlyContinue
-    idf.py set-target esp32s3
-    idf.py build
+    idf.py -B build_d set-target esp32s3
+    idf.py -B build_d build
     ```
 
 12. Não substituir fontes funcionais inteiros por exemplos genéricos. Ler primeiro o conteúdo atual do repositório e fazer alterações pequenas e rastreáveis.
@@ -265,14 +265,17 @@ idf.py --version
 Estrutura definida anteriormente:
 
 ```text
-esp32s3_usb_leitor_ble/
+esp32-s3-usb-barcode-bridge/
+├── AGENTS.md
 ├── CMakeLists.txt
 ├── README.md
 ├── sdkconfig.defaults
 └── main/
     ├── CMakeLists.txt
     ├── idf_component.yml
-    └── main.c
+    ├── main.c
+    ├── ble_hid_keyboard.c
+    └── ble_hid_keyboard.h
 ```
 
 O agente deve verificar a árvore real antes de editar. Arquivos adicionais podem ter sido criados depois.
@@ -341,6 +344,7 @@ Base de referência:
 idf_component_register(
     SRCS
         "main.c"
+        "ble_hid_keyboard.c"
     INCLUDE_DIRS
         "."
     REQUIRES
@@ -363,7 +367,10 @@ Configurações obrigatórias já definidas para resolver o BLE HID:
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_HID_SERVICE=y
+CONFIG_BT_NIMBLE_SECURITY_ENABLE=y
+CONFIG_BT_NIMBLE_SM_LVL=2
 CONFIG_BT_NIMBLE_SVC_GAP_DEVICE_NAME="Leitor QR ESP32"
+CONFIG_BT_NIMBLE_SVC_GAP_APPEARANCE=0x03C1
 CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
 ```
 
@@ -457,41 +464,30 @@ Nomes podem variar levemente conforme a versão exata do componente. Usar a API 
 
 ### 8.4 BLE HID
 
-APIs confirmadas:
+O perfil validado em hardware usa um serviço HOGP local implementado em
+`main/ble_hid_keyboard.c`. Não voltar a usar automaticamente o wrapper
+`esp_hidd_dev_init()` nem o Report ID 1 do exemplo genérico da Espressif.
 
-```c
-esp_hid_gap_init(...)
-esp_hid_ble_gap_adv_init(...)
-esp_hid_ble_gap_adv_start(...)
-esp_hidd_dev_init(...)
-esp_hidd_dev_input_set(...)
-esp_hidd_dev_connected(...)
-```
+Contrato BLE HID obrigatório e validado em iOS e Samsung A54:
 
-Inicialização central:
+- um único Input Report no Report Protocol;
+- relatório com exatamente 8 bytes;
+- sem item `Report ID` no Report Map;
+- Report Reference igual a `{0x00, 0x01}`;
+- primeiro byte `0x00`, pois o mapa não usa Report ID;
+- segundo byte `0x01`, indicando Input Report;
+- sem Output Report;
+- sem Boot Keyboard Input/Output no serviço BLE;
+- HID Information `0x0111`, country code `0x00`, flags `0x02`;
+- Report Map e Report Reference exigem leitura criptografada;
+- notificações do Input Report exigem link criptografado;
+- Battery Service e Device Information Service continuam como serviços
+  primários independentes;
+- não criar External Report Reference para Battery Level, pois o Report Map
+  não descreve relatório de bateria;
+- o envio usa `ble_gatts_notify_custom()` com os 8 bytes, sem prefixar ID.
 
-```c
-esp_hidd_dev_init(
-    &ble_hid_config,
-    ESP_HID_TRANSPORT_BLE,
-    ble_hidd_event_callback,
-    &ble_hid_dev
-);
-```
-
-Envio de um relatório de teclado:
-
-```c
-esp_hidd_dev_input_set(
-    ble_hid_dev,
-    0,      // índice do report map
-    1,      // report ID do teclado
-    report,
-    8
-);
-```
-
-O descritor BLE de teclado precisa ser compatível com um relatório boot keyboard de 8 bytes:
+O formato do Input Report é:
 
 ```text
 Byte 0: modificadores
@@ -503,6 +499,11 @@ Byte 5: tecla 4
 Byte 6: tecla 5
 Byte 7: tecla 6
 ```
+
+Não reintroduzir Report ID 1, Output Report, Boot Report ou External Report
+Reference sem uma necessidade funcional comprovada e um novo teste físico em
+iOS e Android. A combinação anterior conectava, criptografava e notificava com
+sucesso no nível GATT, mas o iOS não a reconhecia como teclado.
 
 ### 8.5 Ligação lógica USB → BLE
 
@@ -528,7 +529,7 @@ Relatório de liberação:
 
 ```c
 uint8_t release[8] = {0};
-esp_hidd_dev_input_set(ble_hid_dev, 0, 1, release, sizeof(release));
+ble_hid_keyboard_input_send(release, sizeof(release));
 ```
 
 Alguns leitores já enviam relatórios de key-down e key-up. Não duplicar a liberação sem verificar o comportamento real.
@@ -566,15 +567,38 @@ Regras:
 - limpar após Enter ou timeout;
 - o encaminhamento BLE não deve depender da conversão para texto quando for possível retransmitir o relatório HID diretamente.
 
-### 8.8 Bonding BLE
+### 8.8 Segurança, identidade e bonding BLE
 
-A configuração histórica incluiu:
+Configuração validada:
 
 ```c
+ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
 ble_hs_cfg.sm_bonding = 1;
+ble_hs_cfg.sm_mitm = 0;
+ble_hs_cfg.sm_sc = 1;
+ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC |
+                             BLE_SM_PAIR_KEY_DIST_ID;
+ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC |
+                               BLE_SM_PAIR_KEY_DIST_ID;
 ```
 
-O projeto deve permitir reconexão com o computador/celular já pareado.
+O pareamento é Security Mode 1 Level 2: criptografado, com bonding, sem
+autenticação MITM. Isso é intencional para um adaptador sem teclado ou tela
+próprios.
+
+A identidade atualmente validada é um endereço random static fixo:
+
+```text
+C4:CB:8F:DA:3D:35
+```
+
+Ao alterar o banco GATT ou o Report Map:
+
+1. usar uma nova identidade random static;
+2. apagar a flash/NVS;
+3. esquecer o dispositivo antigo no iOS e Android;
+4. gravar novamente;
+5. repetir o teste nos dois sistemas.
 
 Ao depurar pareamento antigo:
 
@@ -582,7 +606,7 @@ Ao depurar pareamento antigo:
 - apagar NVS da placa quando necessário:
 
   ```powershell
-  idf.py -p COMx erase-flash
+  idf.py -B build_d -p COM4 erase-flash
   ```
 
 - gravar novamente.
@@ -591,27 +615,33 @@ Ao depurar pareamento antigo:
 
 ## 9. Estado BLE e eventos
 
-A callback BLE deve tratar pelo menos:
+A implementação atual usa eventos GAP do NimBLE, não eventos
+`ESP_HIDD_*`. A callback BLE deve tratar pelo menos:
 
 ```c
-ESP_HIDD_START_EVENT
-ESP_HIDD_CONNECT_EVENT
-ESP_HIDD_DISCONNECT_EVENT
-ESP_HIDD_PROTOCOL_MODE_EVENT
-ESP_HIDD_OUTPUT_EVENT
-ESP_HIDD_STOP_EVENT
+BLE_GAP_EVENT_CONNECT
+BLE_GAP_EVENT_DISCONNECT
+BLE_GAP_EVENT_SUBSCRIBE
+BLE_GAP_EVENT_ENC_CHANGE
+BLE_GAP_EVENT_REPEAT_PAIRING
+BLE_GAP_EVENT_NOTIFY_TX
 ```
 
 Comportamento:
 
-- `START`: iniciar advertising;
 - `CONNECT`: marcar `ble_connected = true`;
 - `DISCONNECT`: marcar `ble_connected = false` e reiniciar advertising;
-- `PROTOCOL_MODE`: registrar Boot/Report;
-- `OUTPUT`: registrar LEDs do teclado, se aplicável;
-- `STOP`: registrar encerramento.
+- `SUBSCRIBE`: aceitar como pronto apenas o handle do Input Report;
+- `ENC_CHANGE`: confirmar criptografia e bonding;
+- `REPEAT_PAIRING`: remover o bond antigo e permitir novo pareamento;
+- `NOTIFY_TX`: registrar o resultado real da notificação.
 
-Nunca chamar `esp_hidd_dev_input_set()` com ponteiro de dispositivo inválido.
+O NimBLE pode entregar `BLE_GAP_EVENT_CONNECT` com status inicial `26` mesmo
+quando o handle já representa uma conexão ativa. Antes de descartar a conexão,
+consultar `ble_gap_conn_find()` e adotar o handle se ele existir.
+
+Não enviar relatórios antes de a conexão estar ativa, criptografada e com a
+notificação do Input Report habilitada.
 
 ---
 
@@ -678,14 +708,17 @@ Depois executar:
 ```powershell
 cd D:\Developer\esp32-s3-usb-barcode-bridge
 
-Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force build_d -ErrorAction SilentlyContinue
 Remove-Item -Force sdkconfig -ErrorAction SilentlyContinue
 
-idf.py set-target esp32s3
-idf.py build
+idf.py -B build_d set-target esp32s3
+idf.py -B build_d build
 ```
 
-Não tentar resolver esse erro removendo `esp_hidd_dev_init()` ou trocando o projeto para Bluetooth clássico.
+Esse erro pertence ao histórico da primeira implementação baseada no wrapper
+`esp_hidd`. A implementação atual usa o serviço HOGP local por razões de
+interoperabilidade com iOS. Não restaurar o wrapper apenas por causa deste
+registro histórico e não trocar o projeto para Bluetooth clássico.
 
 ### 10.1 Validação física registrada em 2026-07-30
 
@@ -702,16 +735,36 @@ idf.py -B build_d set-target esp32s3
 idf.py -B build_d build
 ```
 
-Resultado do build:
+Resultado do build da versão finalmente validada em iOS e Android:
 
 ```text
 Project build complete.
-esp32_s3_usb_barcode_bridge.bin binary size 0x8b6e0 bytes.
+esp32_s3_usb_barcode_bridge.bin binary size 0x87c10 bytes.
 Smallest app partition is 0x177000 bytes.
-0xeb920 bytes (63%) free.
+0xef3f0 bytes (64%) free.
 ```
 
-O firmware foi gravado na placa e o usuário confirmou que o conjunto ficou funcionando. Essa confirmação cobre o teste prático básico de firmware gravado na placa, mas detalhes como VID/PID do leitor, corrente medida do leitor, modelo exato da placa e logs completos de enumeração USB ainda não foram registrados no repositório.
+O firmware foi gravado na placa e o usuário confirmou leitura funcionando no
+iOS e no Samsung Galaxy A54.
+
+A correção final que tornou o iOS funcional foi estrutural:
+
+1. substituição do perfil anterior por um HOGP local mínimo;
+2. remoção do Report ID 1;
+3. manutenção de um único Input Report de 8 bytes;
+4. Report Reference alterado para `{0x00, 0x01}`;
+5. remoção de Output Report e Boot Reports no BLE;
+6. remoção da External Report Reference para Battery Level, já que o Report
+   Map não descreve bateria;
+7. HID Information ajustado para flags `0x02`;
+8. nova identidade BLE random static `C4:CB:8F:DA:3D:35`;
+9. flash/NVS apagada e pareamento antigo removido antes do novo teste.
+
+Antes dessa correção, os logs mostravam conexão criptografada, assinatura do
+Input Report e notificações concluídas com status zero. Mesmo assim, o iOS não
+ocultava o teclado virtual nem entregava as teclas. Portanto, sucesso no
+`notify` GATT não basta para considerar o dispositivo um teclado válido no
+iOS; o contrato do Report Map e do banco GATT acima deve ser preservado.
 
 ---
 
@@ -721,13 +774,13 @@ O firmware foi gravado na placa e o usuário confirmou que o conjunto ficou func
 
 ```powershell
 cd D:\Developer\esp32-s3-usb-barcode-bridge
-idf.py set-target esp32s3
+idf.py -B build_d set-target esp32s3
 ```
 
 ### 11.2 Compilar
 
 ```powershell
-idf.py build
+idf.py -B build_d build
 ```
 
 ### 11.3 Descobrir a porta COM
@@ -742,19 +795,19 @@ Também pode ser conferida no Gerenciador de Dispositivos.
 ### 11.4 Gravar e abrir monitor
 
 ```powershell
-idf.py -p COMx flash monitor
+idf.py -B build_d -p COMx flash monitor
 ```
 
 Substituir `COMx` pela porta real, por exemplo:
 
 ```powershell
-idf.py -p COM7 flash monitor
+idf.py -B build_d -p COM4 flash monitor
 ```
 
 ### 11.5 Apenas monitor
 
 ```powershell
-idf.py -p COMx monitor
+idf.py -B build_d -p COMx monitor
 ```
 
 Sair do monitor:
@@ -784,7 +837,7 @@ A sequência pode variar ligeiramente conforme a placa.
 2. Abrir:
 
    ```powershell
-   idf.py -p COMx monitor
+   idf.py -B build_d -p COM4 monitor
    ```
 
 3. Confirmar boot sem reset contínuo.
@@ -887,23 +940,30 @@ CONFIG_BT_NIMBLE_HID_SERVICE=y
 CONFIG_BT_NIMBLE_SVC_GAP_DEVICE_NAME="Leitor QR ESP32"
 ```
 
-Depois apagar `sdkconfig` e `build`.
+Depois apagar `sdkconfig` e `build_d`.
 
-Também verificar se o advertising é iniciado após `ESP_HIDD_START_EVENT`.
+Também verificar se o advertising é iniciado no callback de sincronização do
+NimBLE.
 
 ### 13.4 BLE conecta, mas não digita
 
 Verificar:
 
 - estado `ble_connected`;
-- `ble_hid_dev` válido;
-- map index;
-- report ID;
-- tamanho do relatório;
+- conexão criptografada;
+- bonding concluído;
+- assinatura ativa no handle do Input Report;
+- relatório com exatamente 8 bytes;
+- ausência de Report ID no mapa e no payload;
+- Report Reference `{0x00, 0x01}`;
 - relatório de liberação;
-- descritor HID;
-- modo Boot/Report;
+- Report Map sem Output/Boot/Battery Report;
+- ausência de External Report Reference para a bateria;
 - se o destino está com campo de texto ativo.
+
+Se `BLE_GAP_EVENT_NOTIFY_TX` informar status zero e ainda assim o iOS não
+digitar, revisar primeiro o contrato GATT/HID desta documentação. Não presumir
+que seja perda de pacote ou aumentar atrasos aleatoriamente.
 
 ### 13.5 Caracteres errados
 
@@ -922,10 +982,10 @@ Para códigos numéricos, normalmente não há problema. Para letras e símbolos
 Executar exatamente:
 
 ```powershell
-Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force build_d -ErrorAction SilentlyContinue
 Remove-Item -Force sdkconfig -ErrorAction SilentlyContinue
-idf.py set-target esp32s3
-idf.py build
+idf.py -B build_d set-target esp32s3
+idf.py -B build_d build
 ```
 
 Depois conferir no `sdkconfig` gerado:
@@ -941,17 +1001,10 @@ CONFIG_BT_NIMBLE_HID_SERVICE=y
 Na inicialização:
 
 ```text
-Projeto: esp32s3_usb_leitor_ble
-ESP-IDF: 5.5.4
-Alvo: esp32s3
-Inicializando NVS
-Inicializando BLE HID
-BLE HID iniciado
-Advertising iniciado
-Inicializando USB Host
+Servico HOGP minimo registrado para teclado Report de 8 bytes sem Report ID
+Endereco BLE random static configurado: C4:CB:8F:DA:3D:35
+Bluetooth anunciando como 'Leitor QR ESP32'
 USB Host iniciado
-HID Host instalado
-Aguardando leitor USB
 ```
 
 Na conexão USB:
@@ -969,6 +1022,7 @@ Na leitura:
 ```text
 USB HID report: ...
 BLE HID report enviado: ...
+BLE notify concluido: ... status=0
 ```
 
 Na desconexão:
@@ -999,15 +1053,26 @@ static void nvs_init_or_erase(void);
 BLE:
 
 ```c
-static esp_err_t ble_hid_init(void);
-static void ble_hidd_event_callback(
-    void *handler_args,
-    esp_event_base_t base,
-    int32_t id,
-    void *event_data
+static void ble_init(void);
+static int ble_gap_event_callback(
+    struct ble_gap_event *event,
+    void *arg
 );
 static void ble_host_task(void *param);
-static esp_err_t ble_send_keyboard_report(
+static void ble_sender_task(void *arg);
+```
+
+O módulo `ble_hid_keyboard.c` deve manter:
+
+```c
+esp_err_t ble_hid_keyboard_service_init(void);
+void ble_hid_keyboard_connection_set(uint16_t conn_handle, bool connected);
+bool ble_hid_keyboard_subscription_update(
+    uint16_t attr_handle,
+    bool notify_enabled
+);
+bool ble_hid_keyboard_ready(void);
+esp_err_t ble_hid_keyboard_input_send(
     const uint8_t *report,
     size_t length
 );
@@ -1046,7 +1111,7 @@ Os nomes reais podem ser diferentes, mas as responsabilidades devem permanecer s
 Uma versão só está concluída quando:
 
 - [ ] compila com ESP-IDF 5.5.4;
-- [ ] usa `idf.py set-target esp32s3`;
+- [ ] usa `idf.py -B build_d set-target esp32s3`;
 - [ ] usa `espressif/usb_host_hid` 1.2.0;
 - [ ] mantém GPIO19 como D+;
 - [ ] mantém GPIO20 como D-;
@@ -1056,7 +1121,12 @@ Uma versão só está concluída quando:
 - [ ] recebe relatórios;
 - [ ] anuncia `Leitor QR ESP32`;
 - [ ] permite pareamento BLE;
+- [ ] usa um Input Report de 8 bytes sem Report ID;
+- [ ] usa Report Reference `{0x00, 0x01}`;
+- [ ] não anuncia External Report Reference para uma bateria ausente do mapa;
 - [ ] envia teclas pelo BLE HID;
+- [ ] funciona no iOS;
+- [ ] funciona no Samsung Galaxy A54 ou Android equivalente;
 - [ ] trata desconexão USB;
 - [ ] trata desconexão BLE;
 - [ ] não bloqueia callbacks;
@@ -1071,15 +1141,13 @@ Uma versão só está concluída quando:
 O agente não deve inventar estas informações:
 
 1. fabricante e revisão exata da placa ESP32-S3 N16R8;
-2. porta COM fixa;
-3. corrente máxima segura do pino 5V da placa;
-4. modelo/interface exata do leitor que será usado no produto final;
-5. VID/PID do leitor;
-6. se o leitor envia boot protocol puro ou relatório HID proprietário;
-7. necessidade de suporte a múltiplas interfaces HID;
-8. layout de teclado final: US, ABNT2 ou outro;
-9. conteúdo integral do primeiro `main.c`;
-10. resultado final do build após a correção, caso não esteja registrado no repositório.
+2. corrente máxima segura do pino 5V da placa;
+3. modelo/interface exata do leitor que será usado no produto final;
+4. VID/PID do leitor;
+5. se o leitor envia boot protocol puro ou relatório HID proprietário;
+6. necessidade de suporte a múltiplas interfaces HID;
+7. layout de teclado final: US, ABNT2 ou outro;
+8. conteúdo integral do primeiro `main.c`.
 
 Esses pontos devem ser descobertos por inspeção do hardware, logs e fontes atuais.
 
@@ -1122,36 +1190,36 @@ Esse diretório local corresponde à versão realmente resolvida pelo projeto.
 ```powershell
 cd D:\Developer\esp32-s3-usb-barcode-bridge
 
-Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force build_d -ErrorAction SilentlyContinue
 Remove-Item -Force sdkconfig -ErrorAction SilentlyContinue
 
-idf.py set-target esp32s3
-idf.py build
+idf.py -B build_d set-target esp32s3
+idf.py -B build_d build
 ```
 
 ### Gravar e monitorar
 
 ```powershell
-idf.py -p COMx flash monitor
+idf.py -B build_d -p COM4 flash monitor
 ```
 
 ### Apenas apagar flash
 
 ```powershell
-idf.py -p COMx erase-flash
+idf.py -B build_d -p COM4 erase-flash
 ```
 
 ### Apenas monitorar
 
 ```powershell
-idf.py -p COMx monitor
+idf.py -B build_d -p COM4 monitor
 ```
 
 ### Ver tamanho
 
 ```powershell
-idf.py size
-idf.py size-components
+idf.py -B build_d size
+idf.py -B build_d size-components
 ```
 
 ---
@@ -1175,6 +1243,15 @@ GPIO20 = D-
 BLE name = Leitor QR ESP32
 NimBLE HID Service habilitado
 Single App Large habilitado
+HOGP local com um Input Report de 8 bytes
+Sem Report ID
+Report Reference = {0x00, 0x01}
+Sem Output Report e sem Boot Reports no BLE
+Sem External Report Reference para Battery Level
+Report Map e Report Reference com leitura criptografada
+Security Mode 1 Level 2, bonding, sem MITM
+Identidade BLE random static C4:CB:8F:DA:3D:35
+Compatibilidade validada em iOS e Samsung Galaxy A54
 ```
 
 O objetivo final é simples:

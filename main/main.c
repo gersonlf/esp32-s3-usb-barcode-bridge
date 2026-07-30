@@ -26,7 +26,6 @@
 #include "esp_log.h"
 #include "esp_bt.h"
 #include "esp_hid_common.h"
-#include "esp_hidd.h"
 #include "nvs_flash.h"
 
 #include "usb/usb_host.h"
@@ -36,24 +35,30 @@
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
 #include "host/ble_hs_adv.h"
+#include "host/ble_hs_id.h"
 #include "host/ble_sm.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
+#include "services/gap/ble_svc_gap.h"
+
+#include "ble_hid_keyboard.h"
 
 #define BLE_DEVICE_NAME             "Leitor QR ESP32"
-#define BLE_KEYBOARD_REPORT_ID      1
 #define BLE_REPORT_QUEUE_LENGTH     64
 #define BLE_SEND_RETRIES            4
 #define BLE_SEND_RETRY_DELAY_MS     6
+#define BLE_KEY_PRESS_DELAY_MS      50
+#define BLE_INTER_REPORT_DELAY_MS   5
 
 static const char *TAG = "USB_BLE_BRIDGE";
 
-static esp_hidd_dev_t *s_ble_hid_dev = NULL;
 static QueueHandle_t s_ble_report_queue = NULL;
 static QueueHandle_t s_usb_event_queue = NULL;
 
 static volatile bool s_ble_connected = false;
-static volatile bool s_ble_ready = false;
+static uint16_t s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static uint8_t s_ble_own_addr_type = BLE_OWN_ADDR_PUBLIC;
+static bool s_ble_random_addr_configured = false;
 
 /*
  * Relatório HID de teclado padrão:
@@ -62,72 +67,23 @@ static volatile bool s_ble_ready = false;
  * bytes 2..7: até seis teclas simultâneas
  */
 typedef struct {
-    uint8_t data[8];
+    uint8_t data[BLE_HID_KEYBOARD_REPORT_SIZE];
 } ble_keyboard_report_t;
 
-/*
- * Descriptor HID de teclado BLE.
- * O Report ID é 1 e o conteúdo enviado por esp_hidd_dev_input_set() tem 8 bytes.
- */
-static const uint8_t s_keyboard_report_map[] = {
-    0x05, 0x01,       /* Usage Page (Generic Desktop) */
-    0x09, 0x06,       /* Usage (Keyboard) */
-    0xA1, 0x01,       /* Collection (Application) */
-    0x85, 0x01,       /* Report ID (1) */
+static bool keyboard_report_has_pressed_key(const ble_keyboard_report_t *report)
+{
+    if (report->data[0] != 0) {
+        return true;
+    }
 
-    0x05, 0x07,       /* Usage Page (Keyboard/Keypad) */
-    0x19, 0xE0,       /* Usage Minimum (Left Control) */
-    0x29, 0xE7,       /* Usage Maximum (Right GUI) */
-    0x15, 0x00,       /* Logical Minimum (0) */
-    0x25, 0x01,       /* Logical Maximum (1) */
-    0x75, 0x01,       /* Report Size (1) */
-    0x95, 0x08,       /* Report Count (8) */
-    0x81, 0x02,       /* Input (Data, Variable, Absolute) */
+    for (size_t i = 2; i < sizeof(report->data); ++i) {
+        if (report->data[i] != 0) {
+            return true;
+        }
+    }
 
-    0x95, 0x01,       /* Report Count (1) */
-    0x75, 0x08,       /* Report Size (8) */
-    0x81, 0x03,       /* Input (Constant) - byte reservado */
-
-    0x95, 0x05,       /* Report Count (5) */
-    0x75, 0x01,       /* Report Size (1) */
-    0x05, 0x08,       /* Usage Page (LEDs) */
-    0x19, 0x01,       /* Usage Minimum (Num Lock) */
-    0x29, 0x05,       /* Usage Maximum (Kana) */
-    0x91, 0x02,       /* Output (Data, Variable, Absolute) */
-
-    0x95, 0x01,       /* Report Count (1) */
-    0x75, 0x03,       /* Report Size (3) */
-    0x91, 0x03,       /* Output (Constant) */
-
-    0x95, 0x06,       /* Report Count (6) */
-    0x75, 0x08,       /* Report Size (8) */
-    0x15, 0x00,       /* Logical Minimum (0) */
-    0x25, 0x65,       /* Logical Maximum (101) */
-    0x05, 0x07,       /* Usage Page (Keyboard/Keypad) */
-    0x19, 0x00,       /* Usage Minimum (0) */
-    0x29, 0x65,       /* Usage Maximum (101) */
-    0x81, 0x00,       /* Input (Data, Array, Absolute) */
-
-    0xC0              /* End Collection */
-};
-
-static esp_hid_raw_report_map_t s_ble_report_maps[] = {
-    {
-        .data = s_keyboard_report_map,
-        .len = sizeof(s_keyboard_report_map),
-    },
-};
-
-static esp_hid_device_config_t s_ble_hid_config = {
-    .vendor_id = 0x303A,
-    .product_id = 0x4001,
-    .version = 0x0100,
-    .device_name = BLE_DEVICE_NAME,
-    .manufacturer_name = "MySoft Sistemas",
-    .serial_number = "ESP32S3-USB-BLE-01",
-    .report_maps = s_ble_report_maps,
-    .report_maps_len = 1,
-};
+    return false;
+}
 
 /* -------------------------------------------------------------------------- */
 /* Bluetooth LE                                                               */
@@ -137,27 +93,120 @@ static struct ble_hs_adv_fields s_adv_fields;
 static ble_uuid16_t s_hid_service_uuid = BLE_UUID16_INIT(0x1812);
 
 static esp_err_t ble_advertising_start(void);
+static void ble_random_static_address_configure(void)
+{
+    if (s_ble_random_addr_configured) {
+        return;
+    }
+
+    /*
+     * iOS pode manter cache GATT agressivo para a identidade BLE publica.
+     * Usar um random static fixo preserva bonding entre reboots e força
+     * uma identidade nova para este firmware de teclado HID.
+     */
+    static const uint8_t random_static_addr[6] = {
+        0x35, 0x3D, 0xDA, 0x8F, 0xCB, 0xC4
+    };
+
+    int rc = ble_hs_id_set_rnd(random_static_addr);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "Nao foi possivel configurar endereco BLE random static: rc=%d", rc);
+        s_ble_own_addr_type = BLE_OWN_ADDR_PUBLIC;
+        return;
+    }
+
+    s_ble_own_addr_type = BLE_OWN_ADDR_RANDOM;
+    s_ble_random_addr_configured = true;
+    ESP_LOGI(TAG, "Endereco BLE random static configurado: C4:CB:8F:DA:3D:35");
+}
+
+static void ble_gap_identity_configure(void)
+{
+    int rc = ble_svc_gap_device_name_set(BLE_DEVICE_NAME);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "Nao foi possivel definir nome GAP BLE: rc=%d", rc);
+    }
+
+    rc = ble_svc_gap_device_appearance_set(ESP_HID_APPEARANCE_KEYBOARD);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "Nao foi possivel definir appearance GAP BLE: rc=%d", rc);
+    } else {
+        ESP_LOGI(TAG, "GAP BLE configurado como teclado: appearance=0x%04x",
+                 ESP_HID_APPEARANCE_KEYBOARD);
+    }
+}
+
+static void ble_security_start(uint16_t conn_handle)
+{
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        return;
+    }
+
+    struct ble_gap_conn_desc desc;
+    int rc = ble_gap_conn_find(conn_handle, &desc);
+    if (rc == 0 && desc.sec_state.encrypted) {
+        ESP_LOGD(TAG, "Seguranca BLE ja esta ativa");
+        return;
+    }
+
+    rc = ble_gap_security_initiate(conn_handle);
+    if (rc == 0) {
+        ESP_LOGI(TAG, "Seguranca BLE iniciada para conn_handle=%u", conn_handle);
+    } else if (rc == BLE_HS_EALREADY) {
+        ESP_LOGD(TAG, "Seguranca BLE ja estava em andamento");
+    } else {
+        ESP_LOGW(TAG, "Nao foi possivel iniciar seguranca BLE: rc=%d", rc);
+    }
+}
+
+static void ble_connection_adopt(uint16_t conn_handle)
+{
+    if (s_ble_connected && s_ble_conn_handle == conn_handle) {
+        return;
+    }
+
+    s_ble_connected = true;
+    s_ble_conn_handle = conn_handle;
+    ble_hid_keyboard_connection_set(conn_handle, true);
+}
 
 static int ble_gap_event_callback(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
 
     switch (event->type) {
-    case BLE_GAP_EVENT_CONNECT:
-        if (event->connect.status == 0) {
-            s_ble_connected = true;
-            s_ble_ready = false;
+    case BLE_GAP_EVENT_CONNECT: {
+        bool link_active = event->connect.status == 0;
+
+        if (!link_active) {
+            struct ble_gap_conn_desc desc;
+            link_active = ble_gap_conn_find(event->connect.conn_handle, &desc) == 0;
+        }
+
+        if (link_active) {
+            ble_connection_adopt(event->connect.conn_handle);
+            if (event->connect.status != 0) {
+                ESP_LOGW(TAG,
+                         "Conexao BLE ativa apesar do status inicial=%d; mantendo conn_handle=%u",
+                         event->connect.status,
+                         event->connect.conn_handle);
+            }
             ESP_LOGI(TAG, "Bluetooth conectado; aguardando pareamento e notificacoes HID");
+            ble_security_start(s_ble_conn_handle);
         } else {
             ESP_LOGW(TAG, "Falha na conexao BLE: status=%d", event->connect.status);
-            ble_advertising_start();
+            if (!s_ble_connected) {
+                ble_advertising_start();
+            }
         }
         return 0;
+    }
 
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "Bluetooth desconectado: motivo=%d", event->disconnect.reason);
         s_ble_connected = false;
-        s_ble_ready = false;
+        ble_hid_keyboard_connection_set(BLE_HS_CONN_HANDLE_NONE, false);
+        s_ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         if (s_ble_report_queue != NULL) {
             xQueueReset(s_ble_report_queue);
         }
@@ -165,18 +214,56 @@ static int ble_gap_event_callback(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_SUBSCRIBE:
-        /* O celular habilita notify na característica de entrada do teclado. */
-        if (event->subscribe.cur_notify || event->subscribe.cur_indicate) {
-            s_ble_ready = true;
-            ESP_LOGI(TAG, "Teclado BLE pronto para transmitir leituras");
+        ESP_LOGI(TAG,
+                 "BLE subscribe: conn=%u attr=%u reason=%u prev_notify=%u cur_notify=%u prev_indicate=%u cur_indicate=%u",
+                 event->subscribe.conn_handle,
+                 event->subscribe.attr_handle,
+                 event->subscribe.reason,
+                 event->subscribe.prev_notify,
+                 event->subscribe.cur_notify,
+                 event->subscribe.prev_indicate,
+                 event->subscribe.cur_indicate);
+
+        bool notify_enabled = event->subscribe.cur_notify ||
+                              event->subscribe.cur_indicate;
+        ble_connection_adopt(event->subscribe.conn_handle);
+        if (ble_hid_keyboard_subscription_update(event->subscribe.attr_handle,
+                                                  notify_enabled)) {
+            if (ble_hid_keyboard_ready()) {
+                ESP_LOGI(TAG, "Teclado BLE pronto para transmitir leituras");
+                ble_security_start(s_ble_conn_handle);
+            } else {
+                ESP_LOGI(TAG, "Host BLE desabilitou o relatorio HID ativo");
+            }
         }
         return 0;
 
     case BLE_GAP_EVENT_ENC_CHANGE:
         if (event->enc_change.status == 0) {
-            ESP_LOGI(TAG, "Conexao BLE criptografada/pareada");
+            struct ble_gap_conn_desc desc;
+            ble_connection_adopt(event->enc_change.conn_handle);
+            int rc = ble_gap_conn_find(event->enc_change.conn_handle, &desc);
+            if (rc == 0) {
+                ESP_LOGI(TAG,
+                         "Conexao BLE criptografada/pareada: encrypted=%u authenticated=%u bonded=%u key_size=%u",
+                         desc.sec_state.encrypted,
+                         desc.sec_state.authenticated,
+                         desc.sec_state.bonded,
+                         desc.sec_state.key_size);
+            } else {
+                ESP_LOGI(TAG, "Conexao BLE criptografada/pareada");
+            }
         } else {
             ESP_LOGW(TAG, "Falha de seguranca BLE: status=%d", event->enc_change.status);
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_NOTIFY_TX:
+        if (!event->notify_tx.indication) {
+            ESP_LOGI(TAG, "BLE notify concluido: conn=%u attr=%u status=%d",
+                     event->notify_tx.conn_handle,
+                     event->notify_tx.attr_handle,
+                     event->notify_tx.status);
         }
         return 0;
 
@@ -216,7 +303,7 @@ static esp_err_t ble_advertising_configure(void)
     s_adv_fields.num_uuids16 = 1;
     s_adv_fields.uuids16_is_complete = 1;
 
-    /* Pareamento "Just Works", adequado a um adaptador sem tela e sem teclado local. */
+    /* Pareamento simples para manter compatibilidade com Android e iOS. */
     ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
     ble_hs_cfg.sm_bonding = 1;
     ble_hs_cfg.sm_mitm = 0;
@@ -232,6 +319,8 @@ static esp_err_t ble_advertising_start(void)
     struct ble_gap_adv_params adv_params;
     memset(&adv_params, 0, sizeof(adv_params));
 
+    ble_random_static_address_configure();
+
     int rc = ble_gap_adv_set_fields(&s_adv_fields);
     if (rc != 0) {
         ESP_LOGE(TAG, "Falha ao configurar anuncio BLE: rc=%d", rc);
@@ -244,13 +333,18 @@ static esp_err_t ble_advertising_start(void)
     adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(50);
 
     rc = ble_gap_adv_start(
-        BLE_OWN_ADDR_PUBLIC,
+        s_ble_own_addr_type,
         NULL,
         BLE_HS_FOREVER,
         &adv_params,
         ble_gap_event_callback,
         NULL
     );
+
+    if (rc == BLE_HS_EALREADY) {
+        ESP_LOGD(TAG, "Advertising BLE ja estava ativo");
+        return ESP_OK;
+    }
 
     if (rc != 0) {
         ESP_LOGW(TAG, "Nao foi possivel iniciar anuncio BLE: rc=%d", rc);
@@ -261,48 +355,10 @@ static esp_err_t ble_advertising_start(void)
     return ESP_OK;
 }
 
-static void ble_hidd_event_callback(
-    void *handler_args,
-    esp_event_base_t base,
-    int32_t id,
-    void *event_data
-)
+static void ble_on_sync(void)
 {
-    (void)handler_args;
-    (void)base;
-
-    esp_hidd_event_t event = (esp_hidd_event_t)id;
-    esp_hidd_event_data_t *param = (esp_hidd_event_data_t *)event_data;
-
-    switch (event) {
-    case ESP_HIDD_START_EVENT:
-        ESP_LOGI(TAG, "Perfil de teclado HID BLE iniciado");
-        ble_advertising_start();
-        break;
-
-    case ESP_HIDD_CONNECT_EVENT:
-        ESP_LOGI(TAG, "Host conectado ao perfil HID BLE");
-        break;
-
-    case ESP_HIDD_OUTPUT_EVENT:
-        /* LEDs do teclado, como Num Lock e Caps Lock. */
-        ESP_LOGD(TAG, "Relatorio de saida HID: id=%u tamanho=%u",
-                 param->output.report_id,
-                 (unsigned)param->output.length);
-        break;
-
-    case ESP_HIDD_DISCONNECT_EVENT:
-        s_ble_connected = false;
-        s_ble_ready = false;
-        break;
-
-    case ESP_HIDD_STOP_EVENT:
-        ESP_LOGI(TAG, "Perfil HID BLE encerrado");
-        break;
-
-    default:
-        break;
-    }
+    ESP_LOGI(TAG, "Perfil de teclado HOGP local iniciado");
+    ESP_ERROR_CHECK(ble_advertising_start());
 }
 
 static void ble_host_task(void *param)
@@ -326,15 +382,12 @@ static void ble_init(void)
     ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BLE));
     ESP_ERROR_CHECK(esp_nimble_init());
 
-    ESP_ERROR_CHECK(esp_hidd_dev_init(
-        &s_ble_hid_config,
-        ESP_HID_TRANSPORT_BLE,
-        ble_hidd_event_callback,
-        &s_ble_hid_dev
-    ));
+    ESP_ERROR_CHECK(ble_hid_keyboard_service_init());
+    ble_gap_identity_configure();
 
     ble_store_config_init();
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+    ble_hs_cfg.sync_cb = ble_on_sync;
 
     ESP_ERROR_CHECK(esp_nimble_enable(ble_host_task));
 }
@@ -349,20 +402,14 @@ static void ble_sender_task(void *arg)
             continue;
         }
 
-        if (!s_ble_ready || s_ble_hid_dev == NULL) {
+        if (!s_ble_connected || !ble_hid_keyboard_ready()) {
             ESP_LOGW(TAG, "Leitura ignorada: nenhum celular/tablet BLE pronto");
             continue;
         }
 
         esp_err_t err = ESP_FAIL;
         for (int attempt = 0; attempt < BLE_SEND_RETRIES; ++attempt) {
-            err = esp_hidd_dev_input_set(
-                s_ble_hid_dev,
-                0,
-                BLE_KEYBOARD_REPORT_ID,
-                report.data,
-                sizeof(report.data)
-            );
+            err = ble_hid_keyboard_input_send(report.data, sizeof(report.data));
 
             if (err == ESP_OK) {
                 break;
@@ -373,10 +420,25 @@ static void ble_sender_task(void *arg)
 
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "Falha ao enviar relatorio BLE: %s", esp_err_to_name(err));
+        } else if (keyboard_report_has_pressed_key(&report)) {
+            ESP_LOGI(TAG,
+                     "BLE HID report enviado: %02x %02x %02x %02x %02x %02x %02x %02x",
+                     report.data[0],
+                     report.data[1],
+                     report.data[2],
+                     report.data[3],
+                     report.data[4],
+                     report.data[5],
+                     report.data[6],
+                     report.data[7]);
         }
 
-        /* Limita a taxa para não sobrecarregar as notificações BLE. */
-        vTaskDelay(pdMS_TO_TICKS(3));
+        /* iPadOS tende a ser menos tolerante a rajadas muito rápidas de notify. */
+        if (keyboard_report_has_pressed_key(&report)) {
+            vTaskDelay(pdMS_TO_TICKS(BLE_KEY_PRESS_DELAY_MS));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(BLE_INTER_REPORT_DELAY_MS));
+        }
     }
 }
 
@@ -405,12 +467,23 @@ static void usb_keyboard_report_forward(const uint8_t *data, size_t length)
     ble_report.data[1] = 0;
     memcpy(&ble_report.data[2], usb_report->key, HID_KEYBOARD_KEY_MAX);
 
-    /*
-     * Envia tanto pressionamentos quanto liberações. A liberação é essencial
-     * para que caracteres repetidos, como "00011", funcionem corretamente.
-     */
     if (xQueueSend(s_ble_report_queue, &ble_report, pdMS_TO_TICKS(20)) != pdTRUE) {
         ESP_LOGW(TAG, "Fila BLE cheia; relatorio do leitor descartado");
+    }
+
+    bool has_pressed_key = keyboard_report_has_pressed_key(&ble_report);
+
+    /*
+     * Alguns hosts, especialmente iPadOS, sao mais rigorosos com o ciclo
+     * key-down/key-up. Enviar um release extra apos cada tecla pressionada e
+     * inofensivo quando o leitor ja manda release, e evita tecla presa quando
+     * o leitor envia apenas o pressionamento.
+     */
+    if (has_pressed_key) {
+        const ble_keyboard_report_t release_report = {0};
+        if (xQueueSend(s_ble_report_queue, &release_report, pdMS_TO_TICKS(20)) != pdTRUE) {
+            ESP_LOGW(TAG, "Fila BLE cheia; release HID descartado");
+        }
     }
 }
 
