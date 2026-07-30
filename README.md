@@ -14,7 +14,7 @@ Leitor de código de barras/QR USB HID
 
 ## Requisitos
 
-- ESP-IDF **5.5.x**.
+- ESP-IDF **5.5.4**.
 - ESP32-S3-N16R8.
 - Leitor configurado como **USB HID Keyboard**.
 - Conector USB-A fêmea.
@@ -25,8 +25,8 @@ Leitor de código de barras/QR USB HID
 | USB-A fêmea | ESP32-S3 / fonte |
 |---|---|
 | VBUS | +5 V da fonte |
-| D- | GPIO19, de preferência com 22 Ω em série |
-| D+ | GPIO20, de preferência com 22 Ω em série |
+| D+ | GPIO19, de preferência com 22 Ω em série |
+| D- | GPIO20, de preferência com 22 Ω em série |
 | GND | GND comum |
 
 Não alimente o leitor pelo pino de 3,3 V. Coloque um capacitor de 470 µF e um de 100 nF próximos ao conector USB-A.

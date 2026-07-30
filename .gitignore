@@ -1,4 +1,5 @@
-﻿build/
+build/
+build_d/
 sdkconfig.old
 .vscode/
 *.bin

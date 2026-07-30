@@ -4,7 +4,7 @@
 >
 > Atualizado em: 2026-07-30  
 > Projeto: `ESP32 S3 Leitor USB`  
-> Pasta usada no Windows: `C:\esp\esp32s3_usb_leitor_ble`
+> Pasta usada no Windows: `D:\Developer\esp32-s3-usb-barcode-bridge`
 
 ---
 
@@ -184,7 +184,7 @@ Diretórios observados nos logs:
 D:\Espressif
 D:\Espressif\frameworks\esp-idf-v5.5.4
 D:\Espressif\python_env\idf5.5_py3.11_env
-C:\esp\esp32s3_usb_leitor_ble
+D:\Developer\esp32-s3-usb-barcode-bridge
 ```
 
 Versões observadas:
@@ -253,8 +253,8 @@ O `IDF_PATH` deve apontar para o framework 5.5.4.
 ### 5.3 Acesso ao projeto
 
 ```powershell
-C:
-cd C:\esp\esp32s3_usb_leitor_ble
+D:
+cd D:\Developer\esp32-s3-usb-barcode-bridge
 idf.py --version
 ```
 
@@ -676,7 +676,7 @@ CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
 Depois executar:
 
 ```powershell
-cd C:\esp\esp32s3_usb_leitor_ble
+cd D:\Developer\esp32-s3-usb-barcode-bridge
 
 Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
 Remove-Item -Force sdkconfig -ErrorAction SilentlyContinue
@@ -687,6 +687,32 @@ idf.py build
 
 Não tentar resolver esse erro removendo `esp_hidd_dev_init()` ou trocando o projeto para Bluetooth clássico.
 
+### 10.1 Validação física registrada em 2026-07-30
+
+Após alinhar os fontes para uso exclusivo em:
+
+```text
+D:\Developer\esp32-s3-usb-barcode-bridge
+```
+
+foi executado build com ESP-IDF 5.5.4 usando:
+
+```powershell
+idf.py -B build_d set-target esp32s3
+idf.py -B build_d build
+```
+
+Resultado do build:
+
+```text
+Project build complete.
+esp32_s3_usb_barcode_bridge.bin binary size 0x8b6e0 bytes.
+Smallest app partition is 0x177000 bytes.
+0xeb920 bytes (63%) free.
+```
+
+O firmware foi gravado na placa e o usuário confirmou que o conjunto ficou funcionando. Essa confirmação cobre o teste prático básico de firmware gravado na placa, mas detalhes como VID/PID do leitor, corrente medida do leitor, modelo exato da placa e logs completos de enumeração USB ainda não foram registrados no repositório.
+
 ---
 
 ## 11. Build, gravação e monitor
@@ -694,7 +720,7 @@ Não tentar resolver esse erro removendo `esp_hidd_dev_init()` ou trocando o pro
 ### 11.1 Selecionar o alvo
 
 ```powershell
-cd C:\esp\esp32s3_usb_leitor_ble
+cd D:\Developer\esp32-s3-usb-barcode-bridge
 idf.py set-target esp32s3
 ```
 
@@ -1094,7 +1120,7 @@ Esse diretório local corresponde à versão realmente resolvida pelo projeto.
 ### Limpar, configurar e compilar
 
 ```powershell
-cd C:\esp\esp32s3_usb_leitor_ble
+cd D:\Developer\esp32-s3-usb-barcode-bridge
 
 Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
 Remove-Item -Force sdkconfig -ErrorAction SilentlyContinue
@@ -1135,7 +1161,7 @@ idf.py size-components
 Trabalhe sempre sobre os fontes atuais da pasta:
 
 ```text
-C:\esp\esp32s3_usb_leitor_ble
+D:\Developer\esp32-s3-usb-barcode-bridge
 ```
 
 Preserve:

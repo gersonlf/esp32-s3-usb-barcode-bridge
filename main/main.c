@@ -2,12 +2,12 @@
  * Adaptador ESP32-S3:
  *   leitor USB HID (código de barras / QR Code) -> teclado Bluetooth LE HID
  *
- * Ambiente recomendado: ESP-IDF 5.5.x
+ * Ambiente recomendado: ESP-IDF 5.5.4
  * Alvo: ESP32-S3
  *
  * USB nativo do ESP32-S3:
- *   GPIO19 = USB D-
- *   GPIO20 = USB D+
+ *   GPIO19 = USB D+
+ *   GPIO20 = USB D-
  *
  * O VBUS de 5 V do conector USB-A deve vir de uma fonte de 5 V adequada.
  */
