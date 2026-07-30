@@ -1,0 +1,46 @@
+{
+  "length": 44,
+  "width": 84,
+  "height": 30,
+  "floor": 3,
+  "roof": 3,
+  "wall": 2,
+  "waterProof": false,
+  "sealThickness": 2,
+  "insertThickness": 2,
+  "insertHeight": 4,
+  "insertClearance": 0.04,
+  "showLid": true,
+  "showBase": true,
+  "showGrid": true,
+  "gridSpacing": 10,
+  "cornerRadius": 3,
+  "holes": [
+    {
+      "shape": "circle",
+      "surface": "left",
+      "diameter": 8,
+      "width": 10,
+      "length": 10,
+      "y": 0,
+      "x": -6
+    },
+    {
+      "shape": "rectangle",
+      "surface": "right",
+      "diameter": 12.5,
+      "width": 21,
+      "length": 10,
+      "y": 0,
+      "x": -6
+    }
+  ],
+  "pcbMounts": [],
+  "internalWalls": [],
+  "wallMounts": false,
+  "wallMountCount": 4,
+  "wallMountScrewDiameter": 3.98,
+  "lidScrews": false,
+  "lidScrewDiameter": 2.98,
+  "baseLidScrewDiameter": 2.88
+}
