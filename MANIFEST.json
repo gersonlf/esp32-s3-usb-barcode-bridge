@@ -1,0 +1,32 @@
+{
+  "project": "esp32-s3-usb-barcode-bridge",
+  "framework": "ESP-IDF 5.5.4",
+  "target": "esp32s3",
+  "component": "espressif/usb_host_hid 1.2.0",
+  "files": [
+    ".opencode/commands/build.md",
+    ".opencode/commands/erase-flash.md",
+    ".opencode/commands/flash-monitor.md",
+    ".opencode/commands/flash.md",
+    ".opencode/commands/monitor.md",
+    ".opencode/commands/ports.md",
+    ".opencode/commands/size.md",
+    ".opencode/commands/validate.md",
+    ".opencode/skills/esp-idf-validation/SKILL.md",
+    ".opencode/skills/esp32-usb-ble-bridge/SKILL.md",
+    "AGENTS.md",
+    "README_OPENCODE.md",
+    "opencode.json",
+    "prompts/build.txt",
+    "prompts/plan.txt",
+    "prompts/review.txt",
+    "scripts/build.ps1",
+    "scripts/erase_flash.ps1",
+    "scripts/flash.ps1",
+    "scripts/flash_monitor.ps1",
+    "scripts/idf_env.ps1",
+    "scripts/monitor.ps1",
+    "scripts/ports.ps1",
+    "scripts/size.ps1"
+  ]
+}
